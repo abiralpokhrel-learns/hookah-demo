@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ORIGINAL Hookah (joke) — 100% real, trust me bro</title>
+<meta name="description" content="Totally ORIGINAL hookah demo. 100% real (joke). 18+. All on-device.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="wrap">
+  <h1>ORIGINAL Hookah <span class="badge">18+</span> <span class="badge joke-badge">100% JOKE</span></h1>
+  <p class="sub">Totally ORIGINAL default hookah (joke) — definitely real, no scam, trust me bro. No tobacco. Smoking is injurious to health.</p>
+
+  <div class="stage-wrap">
+    <video id="cam" playsinline muted autoplay></video>
+    <canvas id="stage"></canvas>
+  </div>
+
+    <div class="controls">
+    <button id="start">1. Confirm 18+ &amp; start front camera</button>
+    <p id="status" role="status">Idle. Click start (joke), allow camera, show face + hand.</p>
+    <ul class="how">
+      <li><b>1. Grab (joke):</b> close a <b>FIST</b> inside the dashed ring — the default hose (joke) attaches to your fist</li>
+      <li><b>2. Inhale (joke):</b> bring fist <b>TO your mouth</b>, keep mouth closed — joke coals glow red, joke water bubbles, meter fills</li>
+      <li><b>3. Blow (joke):</b> pull fist <b>AWAY</b> + open mouth wide — keep it open and the smoke keeps pouring (joke)</li>
+      <li><b>Rings (joke):</b> make a <b>perfect O</b> with your lips for joke rings — sloppy shapes get plain smoke. <b>Big cloud (joke):</b> puff cheeks.</li>
+      <li>Fallback (not a joke): hold <b>SPACE</b> to inhale if face tracking fails, <b>R</b> for ring.</li>
+    </ul>
+    <p class="credit">Built from scratch with MediaPipe (Apache 2.0). The default hookah is a joke — certified 100% original (joke), no scam (joke), trust me bro (joke).</p>
+  </div>
+</main>
+<script>
+// Watchdog (classic script, runs even if the module/CDN below fails):
+// if app.js can't load (file:// blocking modules, or no internet for MediaPipe CDN),
+// the start button would look dead — say so instead of silence.
+window.addEventListener("error", function (e) {
+  if (window.__smokeRunning) return;
+  var s = document.getElementById("status");
+  if (s && !window.__smokeModuleOk) {
+    s.textContent = "Script failed to load (not a joke): " + (e.message || "blocked") + " — need internet for the MediaPipe CDN + a modern browser.";
+  }
+}, true);
+setTimeout(function () {
+  if (!window.__smokeModuleOk && !window.__smokeRunning) {
+    var s = document.getElementById("status");
+    if (s) {
+      var fileMode = location.protocol === "file:";
+      s.textContent = fileMode
+        ? "Still idle (not a joke): you opened this by double-click (file://) — browsers block the app code + camera that way. Serve it instead: open a terminal in this folder, run: python -m http.server 8000 — then open http://localhost:8000 in Chrome/Edge."
+        : "Still idle after 8s (not a joke): app.js or the MediaPipe CDN didn't load — check internet, then refresh. Served over http://localhost is best.";
+    }
+  }
+}, 8000);
+</script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
