@@ -221,6 +221,13 @@ async function startCamera() {
   resize();
   // retry resize once video has real dimensions (mobile reports 0 too early)
   video.addEventListener("loadedmetadata", resize, { once: true });
+  video.addEventListener("playing", resize, { once: true });
+  // if the stream is live but dimensions never arrive, warn instead of black silence
+  setTimeout(() => {
+    if (video.readyState < 2 || video.videoWidth === 0) {
+      say("Camera stream empty (not a joke): permission granted but no frames — try: reload, use rear/front toggle, or close apps using the camera. " + `state=${video.readyState} w=${video.videoWidth}`);
+    }
+  }, 6000);
 }
 
 function resize() {
@@ -447,7 +454,8 @@ async function loop(prevT) {
   }
 
   if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
-    const timeForML = !PERF.detectInterval || now - lastDetectAt > PERF.detectInterval;
+    // models not loaded yet (camera-first startup): just render, skip ML silently
+    const timeForML = hands && face && (!PERF.detectInterval || now - lastDetectAt > PERF.detectInterval);
     if (timeForML) {
       lastDetectAt = now;
       mlTurn = !mlTurn;
@@ -1038,17 +1046,26 @@ startBtn.addEventListener("click", async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("Camera API missing — open this page via localhost or HTTPS (file:// blocks the camera in some browsers).");
     }
-    say("Loading hand + face models… (joke loading screen — first run downloads ~10MB, stay awake)");
-    await initTracking(say);
-    say("Starting front camera… (joke camera crew rolling)");
+    // CAMERA FIRST (was models-first = 10-30s black screen on phones).
+    // Video goes live instantly, models load in background, loop renders
+    // the hookah right away so the stage is never black.
+    say("Starting front camera… (joke camera crew rolling — allow permission)");
     await startCamera();
     running = true;
     window.__smokeRunning = true;
-    say("Camera live (joke). Show face + hand, FIST the dashed ring (joke).");
     requestAnimationFrame(loop);
+    say("Camera live (joke). Loading hand + face models… (~10MB first run, tracking starts when done)");
+    await initTracking(say);
+    say("Camera live (joke). Show face + hand, FIST the dashed ring (joke).");
   } catch (err) {
     console.error(err);
-    say("Failed (not a joke): " + (err?.message || err) + " — need camera permission + localhost/HTTPS + internet for models.");
+    const name = err?.name || "";
+    let hint = "need camera permission + HTTPS + internet for models.";
+    if (name === "NotAllowedError") hint = "camera BLOCKED — tap the lock/camera icon in the address bar, Allow camera, then reload.";
+    else if (name === "NotFoundError" || name === "OverconstrainedError") hint = "no front camera found on this device.";
+    else if (name === "NotReadableError") hint = "camera busy — close other apps/tabs using the camera (Instagram, Snapchat), then reload.";
+    else if (!navigator.mediaDevices?.getUserMedia) hint = "open via HTTPS (Pages URL), not file:// or preview.";
+    say("Failed (not a joke): " + (err?.message || err) + " — " + hint);
     startBtn.disabled = false;
   }
 });
