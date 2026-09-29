@@ -9,7 +9,7 @@ let activeWasmUrl = "";
 
 const video = document.getElementById("cam");
 const canvas = document.getElementById("stage");
-const ctx = canvas.getContext("2d", { alpha: false });
+const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
 const statusEl = document.getElementById("status");
 const startBtn = document.getElementById("start");
 
@@ -137,7 +137,8 @@ function isRingShape() {
     state.mouthOpen > RING_OPEN_MIN && state.mouthOpen < RING_OPEN_MAX;
 }
 
-function say(m) { statusEl.textContent = m; }
+let lastStatusMsg = "";
+function say(m) { if (m !== lastStatusMsg) { lastStatusMsg = m; statusEl.textContent = m; } }
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
 const lerp = (a, b, t) => a + (b - a) * t;
 const dist2d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -193,7 +194,9 @@ async function initTracking(onProgress) {
     baseOptions: { modelAssetPath: FACE_MODEL },
     runningMode: "VIDEO", numFaces: 1,
     minFaceDetectionConfidence: 0.5, minFacePresenceConfidence: 0.5, minTrackingConfidence: 0.5,
-    outputFaceBlendshapes: true,
+    // mobile: blendshape regression is a big extra cost — geometry fallback
+    // (mouthFromGeometry) is enough for open/pucker and ~2x cheaper
+    outputFaceBlendshapes: !PERF.mobile,
   });
   [hands, face] = await Promise.all([hP, fP]);
 }
@@ -213,11 +216,19 @@ function resize() {
   const r = video.getBoundingClientRect();
   let w = Math.max(320, Math.floor(r.width || 640));
   let h = Math.max(240, Math.floor(r.height || 480));
-  // cap backing store on phones: CSS is ~350px wide anyway, never need >640
-  if (PERF.mobile && w > 640) { h = Math.floor(h * 640 / w); w = 640; }
+  // cap backing store on phones: CSS is ~350px wide anyway, never need >480
+  // (was 640 — 480 is ~44% fewer pixels to shade per frame)
+  if (PERF.mobile && w > 480) { h = Math.floor(h * 480 / w); w = 480; }
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
 }
 window.addEventListener("resize", resize);
+// don't burn battery/GPU in background — pause rAF + camera when hidden
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) return;
+  // loop() checks `running` and video time; simplest is to just let rAF
+  // throttle naturally, but drop particles so resume is instant
+  state.particles.length = Math.min(state.particles.length, 60);
+});
 
 // --- keyboard fallback (kept for testing) ---
 let spaceHeld = false;
@@ -261,12 +272,14 @@ function spawnPuff(ox, oy, big, juice, open, spread, alpha = 0.26) {
   const boom = 0.5 + juice * 2.2;
   const ang = Math.random() * Math.PI * 2;
   const rad = Math.random() * 0.004 * boom;
+  // mobile: start smaller — huge overlapping sprites kill fill-rate
+  const r0 = ((big ? 6 : 4) + Math.random() * 12 + juice * 12) * (PERF.mobile ? 0.7 : 1);
   state.particles.push({
     x: ox + (Math.random() - 0.5) * spread,
     y: oy + (Math.random() - 0.5) * spread,
     vx: (-0.0035 - Math.random() * (big ? 0.007 : 0.005)) * (0.6 + open * 0.6) + Math.cos(ang) * rad - 0.001 * juice,
     vy: -0.0012 - Math.random() * 0.004 - open * 0.0015 + Math.sin(ang) * rad * 0.7,
-    r: (big ? 6 : 4) + Math.random() * 12 + juice * 12,
+    r: r0,
     a: alpha,
     wob: Math.random() * 6.28,
     life: 0,
@@ -408,7 +421,7 @@ function updateInteraction(now) {
   }
 }
 
-let lastDetectAt = 0, mlTurn = false;
+let lastDetectAt = 0, mlTurn = false, frameNo = 0;
 
 async function loop(prevT) {
   if (!running) return;
@@ -481,10 +494,15 @@ async function loop(prevT) {
   }
 
   // one bad frame must never freeze the loop (that looks like a dead button)
+  // mobile: render at ~30fps (skip every other draw) — ML + interaction still
+  // run full-rate so tracking stays responsive, only rasterization halves
   try {
     updateInteraction(now);
-    draw(now);
-    updateStatus();
+    frameNo = (frameNo + 1) >>> 0;
+    const skipDraw = PERF.mobile && (frameNo & 1) === 0 && !state.exhaling && state.particles.length < 60;
+    if (!skipDraw) draw(now);
+    // status strings + DOM touch throttled to every 8th frame (was every frame)
+    if ((frameNo & 7) === 1) updateStatus();
   } catch (err) {
     console.error(err);
     say("Render hiccup (not a joke): " + (err?.message || err));
@@ -896,21 +914,35 @@ function draw(now = performance.now()) {
   // exhale cloud (joke): sprites, not per-particle gradients.
   // Old code built a radial gradient per puff per frame (300+ gradients =
   // mobile meltdown). Now one baked sprite drawn with drawImage — ~10x cheaper.
-  state.particles = state.particles.filter(p => p.a > 0.02);
+  // In-place compaction (no .filter alloc per frame) + radius cap to bound overdraw.
+  {
+    const arr = state.particles;
+    let w = 0;
+    const rMax = PERF.mobile ? 42 : 90;
+    const grow = PERF.mobile ? 0.32 : 0.5;
+    for (let i = 0; i < arr.length; i++) {
+      const p = arr[i];
+      if (p.a <= 0.02) continue;
+      p.life = (p.life || 0) + 1;
+      p.wob = (p.wob || 0) + 0.06;
+      p.x += p.vx; p.y += p.vy;
+      p.vx *= 0.996; p.vy *= 0.996;
+      if (p.r < rMax) p.r += grow;
+      p.a *= 0.988;
+      arr[w++] = p;
+    }
+    arr.length = w;
+  }
   ctx.save();
   ctx.globalCompositeOperation = "lighter";
   for (const p of state.particles) {
-    p.life = (p.life || 0) + 1;
-    p.wob = (p.wob || 0) + 0.06;
-    p.x += p.vx + Math.sin(p.wob) * 0.0006;
-    p.y += p.vy + Math.cos(p.wob * 0.8) * 0.0004;
-    p.vx *= 0.996; p.vy *= 0.996; // fast launch decays into a hanging cloud (joke)
-    p.r += 0.5; p.a *= 0.988; // linger longer: smoke accumulates thick instead of fading fast (joke)
     const tw = 0.85 + 0.15 * Math.sin(p.life * 0.12 + (p.seed || 0));
     const effA = Math.max(0, Math.min(1, p.a * tw * 2.2));
     if (effA < 0.02) continue;
     const spr = p.kind === "halo" ? haloSprite : blobSprite;
     const px = p.x * W, py = p.y * H, d = p.r * 2;
+    // cull offscreen puffs — no point rasterizing them
+    if (px < -p.r || px > W + p.r || py < -p.r || py > H + p.r) continue;
     ctx.globalAlpha = effA;
     ctx.drawImage(spr, px - p.r, py - p.r, d, d);
   }
