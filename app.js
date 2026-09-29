@@ -9,9 +9,49 @@ let activeWasmUrl = "";
 
 const video = document.getElementById("cam");
 const canvas = document.getElementById("stage");
-const ctx = canvas.getContext("2d");
+const ctx = canvas.getContext("2d", { alpha: false });
 const statusEl = document.getElementById("status");
 const startBtn = document.getElementById("start");
+
+// --- mobile perf mode: phones can't do 1280p ML + 1200 gradients at 60fps ---
+const IS_MOBILE =
+  /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "") ||
+  Math.min(screen.width || 999, screen.height || 999) < 500 ||
+  (navigator.hardwareConcurrency || 8) <= 4;
+const PERF = {
+  mobile: IS_MOBILE,
+  maxParticles: IS_MOBILE ? 320 : 1200,
+  detectInterval: IS_MOBILE ? 110 : 0, // ms between ML passes (0 = every frame)
+  alternateML: IS_MOBILE,              // hand one tick, face next tick
+  particleMult: IS_MOBILE ? 0.4 : 1,   // spawn fewer puffs
+  ringLumpDiv: IS_MOBILE ? 2.4 : 1,    // fewer ring lumps
+  shadows: !IS_MOBILE,                 // shadowBlur is brutal on mobile GPUs
+};
+// Pre-rendered smoke sprites: one gradient baked ONCE, then drawImage per
+// particle. Creating 300+ radial gradients per frame was the main mobile killer.
+function makePuffSprite(kind) {
+  const S = 64;
+  const c = document.createElement("canvas");
+  c.width = c.height = S;
+  const g = c.getContext("2d");
+  const grad = g.createRadialGradient(S / 2, S / 2, 1, S / 2, S / 2, S / 2);
+  if (kind === "halo") {
+    grad.addColorStop(0, "rgba(225,225,220,0)");
+    grad.addColorStop(0.55, "rgba(225,225,220,0.55)");
+    grad.addColorStop(1, "rgba(225,225,220,0)");
+  } else {
+    grad.addColorStop(0, "rgba(230,230,225,0.9)");
+    grad.addColorStop(0.35, "rgba(230,230,225,0.45)");
+    grad.addColorStop(1, "rgba(230,230,225,0)");
+  }
+  g.fillStyle = grad;
+  g.fillRect(0, 0, S, S);
+  return c;
+}
+const blobSprite = makePuffSprite("blob");
+const haloSprite = makePuffSprite("halo");
+// adaptive: if frames stay slow, shed more particles automatically
+let avgFrameMs = 16, slowFrames = 0;
 
 const HAND_MODEL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
@@ -159,9 +199,10 @@ async function initTracking(onProgress) {
 }
 
 async function startCamera() {
+  // mobile: 640x480 is plenty for hand/face at arm's length, ~3x cheaper to decode + infer
+  const idealW = PERF.mobile ? 640 : 1280, idealH = PERF.mobile ? 480 : 720;
   const stream = await navigator.mediaDevices.getUserMedia({
-    // higher res = far hands stay sharp enough to track (joke HD)
-    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false,
+    video: { width: { ideal: idealW }, height: { ideal: idealH }, facingMode: "user" }, audio: false,
   });
   video.srcObject = stream;
   await video.play();
@@ -170,8 +211,10 @@ async function startCamera() {
 
 function resize() {
   const r = video.getBoundingClientRect();
-  const w = Math.max(320, Math.floor(r.width || 640));
-  const h = Math.max(240, Math.floor(r.height || 480));
+  let w = Math.max(320, Math.floor(r.width || 640));
+  let h = Math.max(240, Math.floor(r.height || 480));
+  // cap backing store on phones: CSS is ~350px wide anyway, never need >640
+  if (PERF.mobile && w > 640) { h = Math.floor(h * 640 / w); w = 640; }
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
 }
 window.addEventListener("resize", resize);
@@ -205,8 +248,9 @@ function startExhale(big) {
   const mp0 = state.mouthPos;
   const ox0 = mp0?.x ?? 0.35, oy0 = mp0?.y ?? 0.4;
   const juice0 = state.charge / MAX_CHARGE;
-  for (let i = 0; i < 30; i++) spawnPuff(ox0, oy0, state.exhaleBig, juice0, 1, 0.1, 0.3);
-  if (state.particles.length > 1200) state.particles.splice(0, state.particles.length - 1200);
+  const starterN = Math.round(30 * PERF.particleMult) || 8;
+  for (let i = 0; i < starterN; i++) spawnPuff(ox0, oy0, state.exhaleBig, juice0, 1, 0.1, 0.3);
+  if (state.particles.length > PERF.maxParticles) state.particles.splice(0, state.particles.length - PERF.maxParticles);
 }
 
 // one smoke puff (joke): textured kinds + shading so the cloud has pattern,
@@ -256,10 +300,10 @@ function emitExhaleTick(W, H, now) {
   const big = state.exhaleBig;
   // smoke according to inhaling (joke): near-full tank = dramatically thicker stream
   const juice = state.charge / MAX_CHARGE; // 1 = deep inhale, 0 = nearly empty
-  const n = Math.max(4, Math.round((big ? 8 : 6) * (0.5 + open) * (0.4 + juice * 1.4)));
+  const n = Math.max(2, Math.round((big ? 8 : 6) * (0.5 + open) * (0.4 + juice * 1.4) * PERF.particleMult));
   const spread = (0.09 + (1 - open) * 0.04) * (0.7 + juice * 0.9); // full tank = born as a wide cloud (joke)
   for (let i = 0; i < n; i++) spawnPuff(ox, oy, big, juice, open, spread);
-  if (state.particles.length > 1200) state.particles.splice(0, state.particles.length - 1200);
+  if (state.particles.length > PERF.maxParticles) state.particles.splice(0, state.particles.length - PERF.maxParticles);
   state.charge = Math.max(0, state.charge - (big ? 2.8 : 2.2));
 }
 
@@ -364,53 +408,76 @@ function updateInteraction(now) {
   }
 }
 
-async function loop() {
+let lastDetectAt = 0, mlTurn = false;
+
+async function loop(prevT) {
   if (!running) return;
   const now = performance.now();
+  // adaptive perf: track frame cost, shed particles if sustained slow
+  if (prevT) {
+    const dt = now - prevT;
+    avgFrameMs = avgFrameMs * 0.95 + Math.min(dt, 100) * 0.05;
+    if (avgFrameMs > 34 && PERF.maxParticles > 150) {
+      if (++slowFrames > 90) { slowFrames = 0; PERF.maxParticles = Math.max(150, Math.floor(PERF.maxParticles * 0.75)); }
+    } else slowFrames = 0;
+  }
 
   if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
-    lastVideoTime = video.currentTime;
-    // hands
-    try {
-      const hr = hands.detectForVideo(video, now);
-      const lm = hr?.landmarks?.[0];
-      if (lm) {
-        const c = lm[9];
-        const raw = { x: 1 - c.x, y: c.y };
-        state.rawFist = raw;
-        state.fistPos = state.fistPos
-          ? { x: lerp(state.fistPos.x, raw.x, 0.45), y: lerp(state.fistPos.y, raw.y, 0.45) }
-          : raw;
-        state.isFist = isFist(lm, state.isFist);
-        state.fistLostSince = 0;
-      } else {
-        state.rawFist = null; state.fistPos = null; state.isFist = false;
-        if (!state.fistLostSince) state.fistLostSince = now;
-      }
-    } catch {}
-    // face
-    try {
-      const fr = face.detectForVideo(video, now);
-      const flm = fr?.faceLandmarks?.[0];
-      if (flm) {
-        state.facePresent = true;
-        const geo = mouthFromGeometry(flm);
-        const cats = fr?.faceBlendshapes?.[0]?.categories;
-        const bOpen = getBlend(cats, "mouthOpen");
-        const bPucker = getBlend(cats, "mouthPucker") || getBlend(cats, "mouthFunnel");
-        const bPuff = getBlend(cats, "cheekPuff");
-        const gOpen = geo?.open ?? 0;
-        // blendshapes if available, else geometry
-        state.mouthOpen = cats ? clamp01(Math.max(bOpen, gOpen * 0.9)) : gOpen;
-        state.mouthPucker = cats ? Math.max(bPucker, geo?.pucker ?? 0) : (geo?.pucker ?? 0);
-        state.cheekPuff = bPuff || 0;
-        if (geo) {
-          state.mouthPos = state.mouthPos
-            ? { x: lerp(state.mouthPos.x, geo.x, 0.5), y: lerp(state.mouthPos.y, geo.y, 0.5) }
-            : { x: geo.x, y: geo.y };
+    const timeForML = !PERF.detectInterval || now - lastDetectAt > PERF.detectInterval;
+    if (timeForML) {
+      lastDetectAt = now;
+      mlTurn = !mlTurn;
+      // mobile: alternate hand / face each pass = ~half the inference cost,
+      // tracking smoothing hides the 1-tick staleness
+      const doHands = !PERF.alternateML || !mlTurn;
+      const doFace = !PERF.alternateML || mlTurn;
+      // hands
+      if (doHands) {
+      try {
+        const hr = hands.detectForVideo(video, now);
+        const lm = hr?.landmarks?.[0];
+        if (lm) {
+          const c = lm[9];
+          const raw = { x: 1 - c.x, y: c.y };
+          state.rawFist = raw;
+          state.fistPos = state.fistPos
+            ? { x: lerp(state.fistPos.x, raw.x, 0.45), y: lerp(state.fistPos.y, raw.y, 0.45) }
+            : raw;
+          state.isFist = isFist(lm, state.isFist);
+          state.fistLostSince = 0;
+        } else {
+          state.rawFist = null; state.fistPos = null; state.isFist = false;
+          if (!state.fistLostSince) state.fistLostSince = now;
         }
-      } else { state.facePresent = false; state.mouthPos = null; state.mouthOpen = 0; state.mouthPucker = 0; }
-    } catch {}
+      } catch {}
+      }
+      // face
+      if (doFace) {
+      try {
+        const fr = face.detectForVideo(video, now);
+        const flm = fr?.faceLandmarks?.[0];
+        if (flm) {
+          state.facePresent = true;
+          const geo = mouthFromGeometry(flm);
+          const cats = fr?.faceBlendshapes?.[0]?.categories;
+          const bOpen = getBlend(cats, "mouthOpen");
+          const bPucker = getBlend(cats, "mouthPucker") || getBlend(cats, "mouthFunnel");
+          const bPuff = getBlend(cats, "cheekPuff");
+          const gOpen = geo?.open ?? 0;
+          // blendshapes if available, else geometry
+          state.mouthOpen = cats ? clamp01(Math.max(bOpen, gOpen * 0.9)) : gOpen;
+          state.mouthPucker = cats ? Math.max(bPucker, geo?.pucker ?? 0) : (geo?.pucker ?? 0);
+          state.cheekPuff = bPuff || 0;
+          if (geo) {
+            state.mouthPos = state.mouthPos
+              ? { x: lerp(state.mouthPos.x, geo.x, 0.5), y: lerp(state.mouthPos.y, geo.y, 0.5) }
+              : { x: geo.x, y: geo.y };
+          }
+        } else { state.facePresent = false; state.mouthPos = null; state.mouthOpen = 0; state.mouthPucker = 0; }
+      } catch {}
+      }
+    }
+    lastVideoTime = video.currentTime;
   }
 
   // one bad frame must never freeze the loop (that looks like a dead button)
@@ -422,7 +489,7 @@ async function loop() {
     console.error(err);
     say("Render hiccup (not a joke): " + (err?.message || err));
   }
-  requestAnimationFrame(loop);
+  requestAnimationFrame((t) => loop(now));
 }
 
 function drawPipe(W, H, now = performance.now()) {
@@ -468,7 +535,7 @@ function drawHookah(W, H, now) {
       });
     }
     // ember sparks above the joke coals while inhaling
-    if (Math.random() < 0.7) {
+    if (Math.random() < (PERF.mobile ? 0.3 : 0.7)) {
       state.embers.push({
         x: bx + (Math.random() - 0.5) * 26 * s,
         y: bowlY - 14 * s,
@@ -503,13 +570,15 @@ function drawHookah(W, H, now) {
   }
 
   // --- embers / joke coal fire ---
+  // mobile: cap ember count + skip shadowBlur (huge GPU cost)
+  if (state.embers.length > (PERF.mobile ? 20 : 80)) state.embers.splice(0, state.embers.length - (PERF.mobile ? 20 : 80));
   state.embers = state.embers.filter(e => e.life > 0.05 && e.y > bowlY - 90 * s);
   for (const e of state.embers) {
     e.x += e.vx; e.y += e.vy; e.vy *= 0.985; e.life *= 0.96;
     ctx.save();
     ctx.globalAlpha = Math.max(0, e.life);
     ctx.fillStyle = e.life > 0.6 ? "#ffd23c" : "#ff5a1f";
-    ctx.shadowColor = "#ff3d00"; ctx.shadowBlur = 10;
+    if (PERF.shadows) { ctx.shadowColor = "#ff3d00"; ctx.shadowBlur = 10; }
     ctx.beginPath(); ctx.arc(e.x, e.y, e.r * e.life, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
   }
@@ -725,7 +794,7 @@ function drawHookahBody(W, H, now, g) {
     // glowing cracks
     if (heat > 0.12) {
       ctx.strokeStyle = `rgba(255,${Math.floor(90 + 120 * heat)},30,${(0.35 + 0.6 * heat).toFixed(3)})`;
-      ctx.shadowColor = "#ff3d00"; ctx.shadowBlur = 8 * heat;
+      if (PERF.shadows) { ctx.shadowColor = "#ff3d00"; ctx.shadowBlur = 8 * heat; }
       ctx.lineWidth = 1.3;
       ctx.beginPath();
       ctx.moveTo(-rr * 0.6, -rr * 0.2 + Math.sin(t * 17) * 1.2);
@@ -767,7 +836,9 @@ function drawHookahBody(W, H, now, g) {
 
 function draw(now = performance.now()) {
   const W = canvas.width, H = canvas.height;
-  ctx.clearRect(0, 0, W, H);
+  // opaque canvas (alpha:false) — fill is faster than clear + composites cheaper
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
 
   drawPipe(W, H, now);
 
@@ -822,8 +893,9 @@ function draw(now = performance.now()) {
   // long exhale stream: pours smoke while the mouth stays open (joke)
   emitExhaleTick(W, H, now);
 
-  // exhale cloud (joke): additive blending melts puffs into one cloudy mass —
-  // no visible disc edges. pattern comes from two puff kinds + shading + shimmer.
+  // exhale cloud (joke): sprites, not per-particle gradients.
+  // Old code built a radial gradient per puff per frame (300+ gradients =
+  // mobile meltdown). Now one baked sprite drawn with drawImage — ~10x cheaper.
   state.particles = state.particles.filter(p => p.a > 0.02);
   ctx.save();
   ctx.globalCompositeOperation = "lighter";
@@ -835,24 +907,15 @@ function draw(now = performance.now()) {
     p.vx *= 0.996; p.vy *= 0.996; // fast launch decays into a hanging cloud (joke)
     p.r += 0.5; p.a *= 0.988; // linger longer: smoke accumulates thick instead of fading fast (joke)
     const tw = 0.85 + 0.15 * Math.sin(p.life * 0.12 + (p.seed || 0));
-    const effA = Math.max(0, p.a * tw);
-    const tone = p.tone || 0.5;
-    const cr = Math.min(255, Math.floor(215 * tone));
-    const cb = Math.min(255, Math.floor(222 * tone));
-    const g = ctx.createRadialGradient(p.x * W, p.y * H, 1, p.x * W, p.y * H, p.r);
-    if (p.kind === "halo") {
-      g.addColorStop(0, `rgba(${cr},${cr},${cb},0)`);
-      g.addColorStop(0.55, `rgba(${cr},${cr},${cb},${(effA * 0.5).toFixed(3)})`);
-      g.addColorStop(1, `rgba(${cr},${cr},${cb},0)`);
-    } else {
-      g.addColorStop(0, `rgba(${cr},${cr},${cb},${(effA * 0.85).toFixed(3)})`);
-      g.addColorStop(0.35, `rgba(${cr},${cr},${cb},${(effA * 0.45).toFixed(3)})`);
-      g.addColorStop(1, `rgba(${cr},${cr},${cb},0)`);
-    }
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(p.x * W, p.y * H, p.r, 0, Math.PI * 2); ctx.fill();
+    const effA = Math.max(0, Math.min(1, p.a * tw * 2.2));
+    if (effA < 0.02) continue;
+    const spr = p.kind === "halo" ? haloSprite : blobSprite;
+    const px = p.x * W, py = p.y * H, d = p.r * 2;
+    ctx.globalAlpha = effA;
+    ctx.drawImage(spr, px - p.r, py - p.r, d, d);
   }
   ctx.restore();
+  ctx.globalAlpha = 1;
   // real smoke rings (joke): textured torus clouds, not cartoon outlines
   state.rings = state.rings.filter(r => r.a > 0.03 && r.r < 170);
   for (const r of state.rings) {
@@ -864,6 +927,7 @@ function draw(now = performance.now()) {
 
 // A real ring is a torus of cloud — soft halo + cloudy rim with lumps,
 // translucent middle. Blobby rim kills the "funny outline" look.
+// Mobile: lumps are sprite drawImages, count divided — no per-lump gradients.
 function drawSmokeRing(r, W, H, now) {
   const cx = r.x * W, cy = r.y * H + Math.sin(r.wob) * 4;
   const R = r.r, a = r.a;
@@ -881,7 +945,8 @@ function drawSmokeRing(r, W, H, now) {
   ctx.lineWidth = thick * 1.2;
   ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
   // cloudy rim: lumps of smoke around the torus, slowly churning
-  const n = Math.max(26, Math.min(64, Math.floor(R * 1.1)));
+  const fullN = Math.max(26, Math.min(64, Math.floor(R * 1.1)));
+  const n = Math.max(10, Math.floor(fullN / PERF.ringLumpDiv));
   const t = now / 1000;
   for (let i = 0; i < n; i++) {
     const ang = (i / n) * Math.PI * 2;
@@ -893,13 +958,11 @@ function drawSmokeRing(r, W, H, now) {
     const lr = thick * (0.45 + 0.4 * Math.abs(Math.sin(ang * 2 + r.seed)));
     const la = a * (0.16 + 0.22 * Math.abs(w1 * 0.6 + w2 * 0.4));
     if (la < 0.02) continue;
-    const g = ctx.createRadialGradient(lx, ly, 0.5, lx, ly, lr);
-    g.addColorStop(0, `rgba(238,238,232,${la.toFixed(3)})`);
-    g.addColorStop(1, "rgba(238,238,232,0)");
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(lx, ly, lr, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = Math.min(1, la * 2.2);
+    ctx.drawImage(blobSprite, lx - lr, ly - lr, lr * 2, lr * 2);
   }
   ctx.restore();
+  ctx.globalAlpha = 1;
 }
 
 function updateStatus() {
