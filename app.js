@@ -9,7 +9,9 @@ let activeWasmUrl = "";
 
 const video = document.getElementById("cam");
 const canvas = document.getElementById("stage");
-const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+// NOTE: must stay transparent (alpha:true) — the <video> sits UNDER this
+// canvas. alpha:false + black fill covered the video = blackout on mobile.
+const ctx = canvas.getContext("2d", { desynchronized: true });
 const statusEl = document.getElementById("status");
 const startBtn = document.getElementById("start");
 
@@ -208,8 +210,17 @@ async function startCamera() {
     video: { width: { ideal: idealW }, height: { ideal: idealH }, facingMode: "user" }, audio: false,
   });
   video.srcObject = stream;
-  await video.play();
+  // iOS Safari robustness: must be muted + inline or play() silently fails = black video
+  video.muted = true;
+  video.playsInline = true;
+  try { await video.play(); } catch (e) {
+    // iOS sometimes needs a second kick after metadata
+    await new Promise((r) => video.addEventListener("loadedmetadata", r, { once: true }));
+    await video.play();
+  }
   resize();
+  // retry resize once video has real dimensions (mobile reports 0 too early)
+  video.addEventListener("loadedmetadata", resize, { once: true });
 }
 
 function resize() {
@@ -619,13 +630,15 @@ function drawHookah(W, H, now) {
     ctx.beginPath(); ctx.moveTo(px, py);
     ctx.bezierCurveTo((px + hx) / 2, (py + hy) / 2 + 60, (px + hx) / 2 + 20, (py + hy) / 2 + 30, hx, hy);
     ctx.stroke();
-    // hose ribs
-    ctx.strokeStyle = "rgba(255,200,140,0.25)"; ctx.lineWidth = 1.5;
-    ctx.setLineDash([4, 7]);
-    ctx.beginPath(); ctx.moveTo(px, py);
-    ctx.bezierCurveTo((px + hx) / 2, (py + hy) / 2 + 60, (px + hx) / 2 + 20, (py + hy) / 2 + 30, hx, hy);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    // hose ribs (skip on mobile: setLineDash + extra stroke is pricey, barely visible)
+    if (!PERF.mobile) {
+      ctx.strokeStyle = "rgba(255,200,140,0.25)"; ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 7]);
+      ctx.beginPath(); ctx.moveTo(px, py);
+      ctx.bezierCurveTo((px + hx) / 2, (py + hy) / 2 + 60, (px + hx) / 2 + 20, (py + hy) / 2 + 30, hx, hy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     // mouthpiece in fist
     const ang = Math.atan2(hy - py, hx - px);
     ctx.translate(hx, hy); ctx.rotate(ang);
@@ -824,10 +837,12 @@ function drawHookahBody(W, H, now, g) {
     ctx.restore();
   }
   // tiny flame licks when really inhaling (joke flames)
+  // mobile: 1 flame instead of 3 — same look at 480p, 3x cheaper
   if (heat > 0.65) {
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
-    for (let i = 0; i < 3; i++) {
+    const flames = PERF.mobile ? 1 : 3;
+    for (let i = 0; i < flames; i++) {
       const fx = bx + (i - 1) * 10 * s + Math.sin(t * 21 + i * 2) * 2.5;
       const fy = bowlY - bowlH * 0.62 - 22 * s - (i % 2) * 4;
       const fh = (10 + Math.sin(t * 25 + i) * 4 + heat * 10) * s;
@@ -854,9 +869,8 @@ function drawHookahBody(W, H, now, g) {
 
 function draw(now = performance.now()) {
   const W = canvas.width, H = canvas.height;
-  // opaque canvas (alpha:false) — fill is faster than clear + composites cheaper
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, W, H);
+  // transparent clear so the <video> underneath shows through
+  ctx.clearRect(0, 0, W, H);
 
   drawPipe(W, H, now);
 
